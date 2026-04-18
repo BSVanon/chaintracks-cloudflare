@@ -1,0 +1,12 @@
+{
+  "name": "chaintracks-cloudflare",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "test": "cargo test 2>&1"
+  },
+  "devDependencies": {
+    "wrangler": "^3"
+  }
+}
