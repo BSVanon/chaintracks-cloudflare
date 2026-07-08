@@ -12,8 +12,15 @@ WHATSONCHAIN_API_KEY = ""
 # catch-up (bulk getHeaders). Leave empty to sync directly from WhatsOnChain.
 UPSTREAM_CHAINTRACKS_URL = ""
 
+# REQUIRED for the /admin/* surface (fail-closed: admin routes answer 503
+# until this secret exists). Set with: npx wrangler secret put ADMIN_TOKEN
+# All /admin/* calls then need:  Authorization: Bearer <token>
+# (Do NOT put the token here — use the secret store.)
+
 [build]
-command = "worker-build --release"
+# Pin worker-build to the worker-crate/wasm-bindgen pairing this repo is
+# tested against (mismatched trios fail with "different bindgen format").
+command = "cargo install -q worker-build@0.7.5 && worker-build --release"
 
 [[d1_databases]]
 binding = "DB"

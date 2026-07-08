@@ -48,16 +48,25 @@ fn wrap_success(value: impl serde::Serialize) -> Result<Response> {
 }
 
 fn wrap_error(message: &str, status_code: u16) -> Result<Response> {
+    // Code tracks the HTTP status (review L-1: everything used to say
+    // ERR_NOT_FOUND, including 503 degraded-service responses).
+    let code = match status_code {
+        404 => "ERR_NOT_FOUND",
+        400 => "ERR_BAD_REQUEST",
+        401 => "ERR_UNAUTHORIZED",
+        503 => "ERR_UNAVAILABLE",
+        _ => "ERR_INTERNAL",
+    };
     let body = serde_json::json!({
         "status": "error",
-        "code": "ERR_NOT_FOUND",
+        "code": code,
         "description": message
     });
     let response = Response::from_json(&body)?;
     Ok(response.with_status(status_code))
 }
 
-pub async fn handle_request(req: Request, env: &Env) -> Result<Response> {
+pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     let path = req.path();
     let method = req.method();
 
@@ -77,6 +86,62 @@ pub async fn handle_request(req: Request, env: &Env) -> Result<Response> {
     };
 
     let db = env.d1("DB")?;
+    // ── /admin/* auth gate ──────────────────────────────────────────────
+    // The admin surface can rewrite arbitrary headers and canonicalize
+    // heights — with the worker URL baked into public configs it MUST be
+    // token-gated. Token lives in the ADMIN_TOKEN worker secret (env.secret;
+    // env.var fallback for local dev — same pattern as WHATSONCHAIN_API_KEY
+    // in sync.rs). FAIL CLOSED: no secret configured ⇒ all admin calls are
+    // refused (503), never open.
+    if path.starts_with("/admin/") {
+        let expected = env
+            .secret("ADMIN_TOKEN")
+            .map(|v| v.to_string())
+            .ok()
+            .or_else(|| env.var("ADMIN_TOKEN").map(|v| v.to_string()).ok())
+            .filter(|s| !s.is_empty());
+        let Some(expected) = expected else {
+            return wrap_error("Admin surface disabled: no ADMIN_TOKEN configured", 503);
+        };
+        let presented = req
+            .headers()
+            .get("Authorization")
+            .ok()
+            .flatten()
+            .and_then(|h| h.strip_prefix("Bearer ").map(|t| t.to_string()));
+        // Constant-time-ish compare: length check + byte fold (no early exit).
+        let authorized = presented
+            .map(|p| {
+                p.len() == expected.len()
+                    && p.bytes()
+                        .zip(expected.bytes())
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0
+            })
+            .unwrap_or(false);
+        if !authorized {
+            return wrap_error("Unauthorized", 401);
+        }
+    }
+
+    // ── /v2 wire shim (go-chaintracks / Arcade contract) ────────────────
+    // Speaks the v2 surface overlay-express-era clients use (ts-stack
+    // GoChaintracksServiceClient; spec source: ts-stack conformance
+    // sync/chaintracks-v2-http.json, reference chaintracks-server@1.0.2).
+    // Mounted at both /v2/* and /chaintracks/v2/* . SSE tip/reorg streams
+    // are NOT implemented (Workers-cron architecture has no push source;
+    // v2 clients poll fine without them).
+    let v2_path = path
+        .strip_prefix("/chaintracks/v2")
+        .or_else(|| path.strip_prefix("/v2"))
+        .map(|p| p.to_string());
+    if let Some(v2p) = v2_path {
+        if method == Method::Get {
+            return handle_v2(&db, env, &chain, &v2p, &req.url()?).await;
+        }
+        return v2_error("ERR_NOT_FOUND", "Not found", 404);
+    }
+
     let response = match (method, path.as_str()) {
         // Health (plain text, no wrapper — matches production root endpoint)
         (Method::Get, "/") => health(&chain),
@@ -85,6 +150,12 @@ pub async fn handle_request(req: Request, env: &Env) -> Result<Response> {
         (Method::Get, "/getChain") => wrap_success(chain.as_str()),
         (Method::Get, "/getInfo") => get_info(&db, &chain).await,
         (Method::Get, "/currentHeight") => current_height(&db).await,
+        // TS ChaintracksService wire parity: the toolbox client and
+        // rust-overlay probe /getPresentHeight (external chain height).
+        // WoC is the truthful source; our own tip is the fallback when WoC
+        // is unreachable (slightly stale is better than 404-breaking every
+        // stock client).
+        (Method::Get, "/getPresentHeight") => get_present_height(&db, &chain).await,
 
         // Chain tip
         (Method::Get, "/findChainTipHashHex") => find_chain_tip_hash(&db).await,
@@ -92,8 +163,9 @@ pub async fn handle_request(req: Request, env: &Env) -> Result<Response> {
 
         // Header queries
         (Method::Get, "/findHeaderHexForHeight") => {
+            // (read-through grace: see ensure_fresh_header)
             let url = req.url()?;
-            find_header_hex_for_height(&db, &url).await
+            find_header_hex_for_height(&db, env, &chain, &url).await
         }
         (Method::Get, "/findHeaderHexForBlockHash") => {
             let url = req.url()?;
@@ -107,7 +179,25 @@ pub async fn handle_request(req: Request, env: &Env) -> Result<Response> {
         // Validation
         (Method::Get, "/isValidRootForHeight") => {
             let url = req.url()?;
-            is_valid_root_for_height(&db, &url).await
+            is_valid_root_for_height(&db, env, &chain, &url).await
+        }
+
+        // Admin: ingest raw headers pushed by an operator (concatenated
+        // 80-byte header hex in the body, heights from ?start=). For gaps
+        // where in-worker WoC fetching is rate-limited — the operator
+        // fetches at their own pace and pushes.
+        (Method::Post, "/admin/ingest") => {
+            let url = req.url()?;
+            let body = req.text().await?;
+            admin_ingest(&db, &url, &body).await
+        }
+
+        // Admin: backfill a below-tip header gap from WoC. The cron only
+        // walks forward from the tip, so a hole under it (e.g. between the
+        // stale CDN bulk files and the live window) is never revisited.
+        (Method::Get, "/admin/backfill") => {
+            let url = req.url()?;
+            admin_backfill(&db, &chain, env, &url).await
         }
 
         // Admin: trigger bulk CDN sync for a single file
@@ -142,8 +232,25 @@ async fn get_info(db: &worker::D1Database, chain: &Chain) -> Result<Response> {
 }
 
 async fn current_height(db: &worker::D1Database) -> Result<Response> {
-    let height = storage::get_chain_tip_height(db).await?;
-    wrap_success(height)
+    // A missing tip row is a DEGRADED-SERVICE state, never chain state: the
+    // old code returned {status:"success", value:0}, which a consumer reads
+    // as a 953k-block reorg or a frozen clock (audit C4). Error instead so
+    // callers fall back to another source.
+    match storage::find_chain_tip(db).await? {
+        Some(tip) => wrap_success(tip.height),
+        None => wrap_error("No chain tip (service syncing or degraded)", 503),
+    }
+}
+
+async fn get_present_height(db: &worker::D1Database, chain: &Chain) -> Result<Response> {
+    let client = crate::woc::WocClient::new(chain, None);
+    match client.get_chain_info().await {
+        Ok(info) if info.blocks > 0 => wrap_success(info.blocks),
+        _ => match storage::find_chain_tip(db).await? {
+            Some(tip) => wrap_success(tip.height),
+            None => wrap_error("No chain tip (service syncing or degraded)", 503),
+        },
+    }
 }
 
 async fn find_chain_tip_hash(db: &worker::D1Database) -> Result<Response> {
@@ -161,17 +268,76 @@ async fn find_chain_tip_header_hex(db: &worker::D1Database) -> Result<Response> 
     }
 }
 
-async fn find_header_hex_for_height(db: &worker::D1Database, url: &url::Url) -> Result<Response> {
+async fn find_header_hex_for_height(
+    db: &worker::D1Database,
+    env: &Env,
+    chain: &Chain,
+    url: &url::Url,
+) -> Result<Response> {
     let height: u32 = url
         .query_pairs()
         .find(|(k, _)| k == "height")
         .and_then(|(_, v)| v.parse().ok())
         .ok_or_else(|| Error::RustError("Missing ?height= parameter".into()))?;
 
-    match storage::find_header_for_height(db, height).await? {
-        Some(h) => wrap_success(PublicBlockHeader::from(h)),
-        None => wrap_error("Header not found", 404),
+    if let Some(h) = storage::find_header_for_height(db, height).await? {
+        return wrap_success(PublicBlockHeader::from(h));
     }
+    // Fresh-block grace: verified read-through from WoC (tip+1..=tip+6).
+    if ensure_fresh_header(db, env, chain, height).await?.is_some() {
+        if let Some(h) = storage::find_header_for_height(db, height).await? {
+            return wrap_success(PublicBlockHeader::from(h));
+        }
+    }
+    wrap_error("Header not found", 404)
+}
+
+/// Read-through grace window for FRESH blocks (owner decision 2026-07-08):
+/// the cron ingests once a minute, so a just-mined block is locally unknown
+/// for up to ~60s — and a fail-closed consumer (overlay SPV) would bounce a
+/// legitimate proof during that window. If the requested height is at most
+/// GRACE_BLOCKS above our tip, fetch it live from WoC NOW, ingest it through
+/// the full validation path (hash integrity, badPrev, parent backfill, work
+/// accounting), and serve the verified answer. This is "grace WITH
+/// verification" — the TS references are equally fail-closed but query WoC
+/// live, so this exactly reproduces their effective behavior. A height
+/// beyond the grace window (or unknown to WoC too) still answers 404:
+/// unverifiable is never accepted.
+const GRACE_BLOCKS: u32 = 6;
+
+async fn ensure_fresh_header(
+    db: &worker::D1Database,
+    env: &Env,
+    chain: &Chain,
+    height: u32,
+) -> Result<Option<()>> {
+    let tip = match storage::find_chain_tip(db).await? {
+        Some(t) => t.height,
+        None => return Ok(None),
+    };
+    if height <= tip || height > tip.saturating_add(GRACE_BLOCKS) {
+        return Ok(None);
+    }
+    let api_key = env
+        .secret("WHATSONCHAIN_API_KEY")
+        .map(|v| v.to_string())
+        .ok()
+        .or_else(|| env.var("WHATSONCHAIN_API_KEY").map(|v| v.to_string()).ok())
+        .filter(|s| !s.is_empty());
+    let client = crate::woc::WocClient::new(chain, api_key);
+    // Fill the whole gap tip+1..=height so linkage/backfill stays simple.
+    for h in (tip + 1)..=height {
+        match client.get_header_by_height(h).await {
+            Ok(header) => {
+                let _ = crate::sync::insert_with_parent_backfill(db, &client, header).await?;
+            }
+            Err(e) => {
+                worker::console_log!("read-through: WoC has no header at {} yet: {:?}", h, e);
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(()))
 }
 
 async fn find_header_hex_for_block_hash(
@@ -202,11 +368,17 @@ async fn get_headers(db: &worker::D1Database, url: &url::Url) -> Result<Response
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(1);
 
-    let hex_str = storage::get_headers_hex(db, height, count).await?;
+    // Public cap only — internal callers (R2 export) read full 100k files.
+    let hex_str = storage::get_headers_hex(db, height, count.min(10_000)).await?;
     wrap_success(&hex_str)
 }
 
-async fn is_valid_root_for_height(db: &worker::D1Database, url: &url::Url) -> Result<Response> {
+async fn is_valid_root_for_height(
+    db: &worker::D1Database,
+    env: &Env,
+    chain: &Chain,
+    url: &url::Url,
+) -> Result<Response> {
     let root = url
         .query_pairs()
         .find(|(k, _)| k == "root")
@@ -218,8 +390,297 @@ async fn is_valid_root_for_height(db: &worker::D1Database, url: &url::Url) -> Re
         .and_then(|(_, v)| v.parse().ok())
         .ok_or_else(|| Error::RustError("Missing ?height= parameter".into()))?;
 
-    let valid = storage::is_valid_root_for_height(db, &root, height).await?;
-    wrap_success(valid)
+    // Tri-state (audit C1, Go BHS INVALID vs UNABLE_TO_VERIFY split):
+    //  * active header at height + root matches   → success true
+    //  * active header at height + root differs   → success false (factual)
+    //  * NO active header at height (hole / above tip / reorg window)
+    //    → 404 error — "unable to verify" must be distinguishable from
+    //    "invalid", or a storage hole reads as proof-rejection downstream
+    //    (wallet-infra already treats an error here as "fall back to WoC").
+    if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
+        return wrap_success(valid);
+    }
+    // Fresh-block grace: verified read-through from WoC (tip+1..=tip+6).
+    if ensure_fresh_header(db, env, chain, height).await?.is_some() {
+        if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
+            return wrap_success(valid);
+        }
+    }
+    wrap_error(
+        &format!("No active header at height {height} — unable to verify root"),
+        404,
+    )
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// /v2 wire shim — go-chaintracks contract
+// (vectors: ts-stack conformance/vectors/sync/chaintracks-v2-http.json)
+// ═════════════════════════════════════════════════════════════════════════
+
+fn v2_error(code: &str, description: &str, status: u16) -> Result<Response> {
+    let body = serde_json::json!({
+        "status": "error",
+        "code": code,
+        "description": description,
+    });
+    Ok(Response::from_json(&body)?.with_status(status))
+}
+
+fn v2_json(value: impl serde::Serialize, cache: &str) -> Result<Response> {
+    let body = serde_json::json!({ "status": "success", "value": value });
+    let resp = Response::from_json(&body)?;
+    let headers = resp.headers().clone();
+    let _ = headers.set("Cache-Control", cache);
+    Ok(resp.with_headers(headers))
+}
+
+fn v2_binary(bytes: Vec<u8>, cache: &str, extra: &[(&str, String)]) -> Result<Response> {
+    let resp = Response::from_bytes(bytes)?;
+    let headers = resp.headers().clone();
+    let _ = headers.set("Content-Type", "application/octet-stream");
+    let _ = headers.set("Cache-Control", cache);
+    for (k, v) in extra {
+        let _ = headers.set(k, v);
+    }
+    Ok(resp.with_headers(headers))
+}
+
+fn v2_valid_hash(h: &str) -> bool {
+    h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+async fn handle_v2(
+    db: &worker::D1Database,
+    env: &Env,
+    chain: &Chain,
+    v2_path: &str,
+    url: &url::Url,
+) -> Result<Response> {
+    match v2_path {
+        "/network" => v2_json(chain.as_str(), "no-cache"),
+
+        "/tip" | "/tip.bin" => {
+            let Some(tip) = storage::find_chain_tip(db).await? else {
+                return v2_error("ERR_NO_TIP", "Chain tip not found", 404);
+            };
+            if v2_path.ends_with(".bin") {
+                let height = tip.height.to_string();
+                v2_binary(
+                    tip.to_bytes().to_vec(),
+                    "no-cache",
+                    &[("X-Block-Height", height)],
+                )
+            } else {
+                v2_json(PublicBlockHeader::from(tip), "no-cache")
+            }
+        }
+
+        p if p.starts_with("/header/height/") => {
+            let raw = p.trim_start_matches("/header/height/");
+            let (raw, want_bin) = match raw.strip_suffix(".bin") {
+                Some(r) => (r, true),
+                None => (raw, false),
+            };
+            let Ok(height) = raw.parse::<u32>() else {
+                return v2_error("ERR_INVALID_PARAMS", "Invalid height parameter", 400);
+            };
+            let mut header = storage::find_header_for_height(db, height).await?;
+            if header.is_none() {
+                // Same fresh-block read-through grace as the v1 surface.
+                if ensure_fresh_header(db, env, chain, height).await?.is_some() {
+                    header = storage::find_header_for_height(db, height).await?;
+                }
+            }
+            match header {
+                Some(h) if want_bin => {
+                    let hh = h.height.to_string();
+                    v2_binary(
+                        h.to_bytes().to_vec(),
+                        "public, max-age=3600",
+                        &[("X-Block-Height", hh)],
+                    )
+                }
+                Some(h) => v2_json(PublicBlockHeader::from(h), "public, max-age=3600"),
+                None => v2_error(
+                    "ERR_NOT_FOUND",
+                    &format!("Header not found at height {height}"),
+                    404,
+                ),
+            }
+        }
+
+        p if p.starts_with("/header/hash/") => {
+            let raw = p.trim_start_matches("/header/hash/");
+            let (raw, want_bin) = match raw.strip_suffix(".bin") {
+                Some(r) => (r, true),
+                None => (raw, false),
+            };
+            if !v2_valid_hash(raw) {
+                return v2_error("ERR_INVALID_PARAMS", "Invalid hash parameter", 400);
+            }
+            match storage::find_active_header_for_hash(db, &raw.to_lowercase()).await? {
+                Some(h) if want_bin => {
+                    let hh = h.height.to_string();
+                    v2_binary(
+                        h.to_bytes().to_vec(),
+                        "public, max-age=3600",
+                        &[("X-Block-Height", hh)],
+                    )
+                }
+                Some(h) => v2_json(PublicBlockHeader::from(h), "public, max-age=3600"),
+                None => v2_error(
+                    "ERR_NOT_FOUND",
+                    &format!("Header not found for hash {raw}"),
+                    404,
+                ),
+            }
+        }
+
+        "/headers" | "/headers.bin" => {
+            let q = |k: &str| {
+                url.query_pairs()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, v)| v.to_string())
+            };
+            let Some(height) = q("height").and_then(|v| v.parse::<u32>().ok()) else {
+                return v2_error(
+                    "ERR_INVALID_PARAMS",
+                    "Invalid or missing height parameter",
+                    400,
+                );
+            };
+            let count = match q("count").and_then(|v| v.parse::<u32>().ok()) {
+                Some(c) if c >= 1 => c,
+                _ => {
+                    return v2_error(
+                        "ERR_INVALID_PARAMS",
+                        "Invalid or missing count parameter",
+                        400,
+                    )
+                }
+            };
+            // Public cap mirrors the v1 route; huge counts truncate to what
+            // exists (the vector expects X-Header-Count <= requested).
+            let hex_str = storage::get_headers_hex(db, height, count.min(10_000)).await?;
+            let bytes = hex::decode(&hex_str)
+                .map_err(|e| Error::RustError(format!("hex decode: {e}")))?;
+            let n = (bytes.len() / 80) as u32;
+            v2_binary(
+                bytes,
+                "public, max-age=3600",
+                &[
+                    ("X-Start-Height", height.to_string()),
+                    ("X-Header-Count", n.to_string()),
+                ],
+            )
+        }
+
+        _ => v2_error("ERR_NOT_FOUND", "Not found", 404),
+    }
+}
+
+/// Admin endpoint: ingest operator-pushed headers.
+/// Usage: POST /admin/ingest?start=942761 with the body a hex string of
+/// concatenated 80-byte headers (heights assigned sequentially from start).
+/// Linkage/PoW sanity lives with the operator; heights below the tip never
+/// move the chain tip.
+async fn admin_ingest(db: &worker::D1Database, url: &url::Url, body: &str) -> Result<Response> {
+    let Some(start) = url
+        .query_pairs()
+        .find(|(k, _)| k == "start")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+    else {
+        return wrap_error("Missing start query parameter", 400);
+    };
+    let hex_str = body.trim();
+    let bytes = match hex::decode(hex_str) {
+        Ok(b) => b,
+        Err(e) => return wrap_error(&format!("hex decode: {e}"), 400),
+    };
+    if bytes.is_empty() || bytes.len() % 80 != 0 {
+        return wrap_error("body must be a non-empty multiple of 80 bytes", 400);
+    }
+    let mut headers = Vec::with_capacity(bytes.len() / 80);
+    for (i, chunk) in bytes.chunks(80).enumerate() {
+        if let Some(header) = BlockHeader::from_bytes(chunk, start + i as u32) {
+            headers.push(header);
+        }
+    }
+    let inserted = storage::insert_headers_batch(db, &headers).await?;
+    // Ingest is an authoritative canonical statement for each height: the
+    // pushed header becomes the active row and any competing row at that
+    // height (stale reorg branch, wipe debris) is deactivated — observed
+    // live: a stale 952854 stayed active and failed isValidRootForHeight
+    // for the TRUE root, so wallet-infra rejected valid BEEFs.
+    let canonicalized = storage::canonicalize_heights(db, &headers).await?;
+    wrap_success(serde_json::json!({
+        "start": start,
+        "parsed": headers.len(),
+        "inserted": inserted,
+        "canonicalized": canonicalized,
+    }))
+}
+
+/// Admin endpoint: backfill a below-tip gap one header at a time from WoC.
+/// Usage: /admin/backfill?from=942761&to=943500 — the span is clamped to 800
+/// heights per invocation (Workers subrequest budget); drive larger gaps with
+/// repeated calls. Inserts via the batch path and never touches the chain
+/// tip (the gap is below it by definition).
+async fn admin_backfill(
+    db: &worker::D1Database,
+    chain: &Chain,
+    env: &worker::Env,
+    url: &url::Url,
+) -> Result<Response> {
+    let get = |k: &str| -> Option<u32> {
+        url.query_pairs()
+            .find(|(key, _)| key == k)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let (Some(from), Some(to)) = (get("from"), get("to")) else {
+        return wrap_error("Missing from/to query parameters", 400);
+    };
+    if to < from {
+        return wrap_error("to must be >= from", 400);
+    }
+    // ~800 WoC subrequests per invocation keeps us inside the 1000 cap.
+    let to = to.min(from + 799);
+
+    // The key is a worker SECRET (env.secret), with a var fallback for
+    // local dev — env.var() fails silently on secrets.
+    let api_key = env
+        .secret("WHATSONCHAIN_API_KEY")
+        .map(|v| v.to_string())
+        .ok()
+        .or_else(|| env.var("WHATSONCHAIN_API_KEY").map(|v| v.to_string()).ok())
+        .filter(|s| !s.is_empty());
+    let client = crate::woc::WocClient::new(chain, api_key);
+
+    let mut headers = Vec::with_capacity((to - from + 1) as usize);
+    for height in from..=to {
+        match client.get_header_by_height(height).await {
+            Ok(header) => headers.push(header),
+            Err(e) => {
+                // Insert what we have — the caller re-runs from the gap.
+                console_log!("backfill: WoC failed at {height}: {e:?}");
+                break;
+            }
+        }
+    }
+    let fetched = headers.len() as u32;
+    let inserted = if headers.is_empty() {
+        0
+    } else {
+        storage::insert_headers_batch(db, &headers).await?
+    };
+
+    wrap_success(serde_json::json!({
+        "from": from,
+        "to": to,
+        "fetched": fetched,
+        "inserted": inserted,
+        "nextFrom": from + fetched,
+    }))
 }
 
 /// Admin endpoint: download one bulk CDN file and insert into D1.
@@ -264,6 +725,15 @@ async fn admin_bulk_sync(
     // Update chain tip
     storage::update_chain_tip_to_highest(db).await?;
 
+    // Self-heal dual-active debris this bulk path can create (review M-3 —
+    // the sweep otherwise only runs on cron catch-up, which may be never).
+    crate::d1::Query::new(
+        "UPDATE headers SET is_active = 0 WHERE is_active = 1 AND header_id NOT IN \
+         (SELECT MAX(header_id) FROM headers WHERE is_active = 1 GROUP BY height)",
+    )
+    .run(db)
+    .await?;
+
     wrap_success(serde_json::json!({
         "file": file_info.file_name,
         "startHeight": start_height,
@@ -283,7 +753,11 @@ async fn admin_export_r2(
     let bucket = env.bucket("BULK_HEADERS")?;
 
     // Use the worker's own URL as CDN base (served via /headers/ route)
-    let cdn_base_url = format!("https://{}/headers", url.host_str().unwrap_or("localhost"));
+    let cdn_base_url = format!(
+        "https://{}/headers",
+        url.host_str()
+            .unwrap_or("localhost")
+    );
 
     let file_param: Option<u32> = url
         .query_pairs()

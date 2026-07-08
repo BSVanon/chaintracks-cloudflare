@@ -24,6 +24,38 @@ Cloudflare Workers are stateless and request-based, so several TS server feature
 
 None of these are missing features — they're architectural trade-offs for serverless. All public HTTP endpoints are at parity with TS.
 
+## 2026-07 hardening release (v0.2.0)
+
+This snapshot brings the public repo up to the fully hardened implementation
+(audited against TS wallet-toolbox v2.4.0 chaintracks + the Go BHS tracker,
+then adversarially reviewed; the chain-work math is verified against a bigint
+harness on 10k randomized cases):
+
+- **Chain-truth correctness**: exact 256-bit cumulative chain work
+  (`2^256/(target+1)`, genesis vector `0x100010001`) with more-work tip
+  selection; equal-height/competing-branch reorgs detected via
+  `bestblockhash` and repaired with by-hash parent backfill (bounded 36,
+  TS `addLiveRecursionLimit` parity); a refused reorg (no common ancestor)
+  leaves the tip untouched; reorg walks apply as batched transactions.
+- **No lies to consumers**: `/currentHeight` answers 503 (never a fake 0)
+  when degraded; `/isValidRootForHeight` distinguishes "unable to verify"
+  (404 — hole/above-tip/reorg window) from a factual root mismatch
+  (`false`); `/getInfo` exposes `lastSyncedAt`/`lastSyncedHeight` freshness.
+- **Ingest integrity**: header hashes recomputed from the 80 bytes and
+  mismatches rejected; `badPrev` height-linkage check; linkage guards on
+  every bulk path; R2 exports refuse misaligned files.
+- **Fresh-block grace**: lookups within `tip+6` trigger a verified live
+  read-through from WhatsOnChain (full validation, never blind acceptance),
+  so fail-closed SPV consumers don't bounce proofs from just-mined blocks.
+- **`/admin/*` is token-gated and fail-closed**: set the `ADMIN_TOKEN`
+  worker secret (`npx wrangler secret put ADMIN_TOKEN`); until it exists,
+  admin routes answer 503. Calls use `Authorization: Bearer <token>`.
+- **`/v2` wire shim**: the go-chaintracks/Arcade v2 contract
+  (`/v2/network`, `/v2/tip[.bin]`, `/v2/header/height/{h}[.bin]`,
+  `/v2/header/hash/{hash}[.bin]`, `/v2/headers[.bin]`), validated against
+  the ts-stack conformance vectors (20/20 testable vectors pass). SSE
+  streams are not implemented (cron-pull architecture); v2 clients poll.
+
 ## HTTP API
 
 | Endpoint | Description |

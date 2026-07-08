@@ -145,38 +145,172 @@ pub fn compute_block_hash(header_bytes: &[u8]) -> String {
     hex::encode(reversed)
 }
 
-/// Calculate chain work from difficulty bits (compact target format).
-/// Returns 64-character hex string.
-///
-/// Based on bsv-wallet-toolbox-rs calculate_work with overflow protection.
-#[allow(dead_code)]
-pub fn calculate_work(bits: u32) -> String {
-    let exponent = bits >> 24;
-    let mantissa = (bits & 0x007fffff) as u128;
+// ─── 256-bit work arithmetic ────────────────────────────────────────────────
+//
+// The previous calculate_work used u128 and returned the CONSTANT "…0001"
+// for every real mainnet header (any exponent >= 0x13 hit the shift>=128
+// early-return), making stored chain_work useless for tip selection (audit
+// M2). The reference computes exact 256-bit work (TS wallet-toolbox
+// blockHeaderUtilities.ts convertBitsToWork via BigNumber; Bitcoin's
+// work = 2^256 / (target+1) = (~target)/(target+1) + 1).
+//
+// U256 = little-endian [u64; 4] limbs. Only what work math needs: not,
+// add-with-carry, compare, shift-subtract division.
 
+type U256 = [u64; 4];
+
+fn u256_is_zero(a: &U256) -> bool {
+    a.iter().all(|&x| x == 0)
+}
+
+fn u256_cmp(a: &U256, b: &U256) -> std::cmp::Ordering {
+    for i in (0..4).rev() {
+        match a[i].cmp(&b[i]) {
+            std::cmp::Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn u256_not(a: &U256) -> U256 {
+    [!a[0], !a[1], !a[2], !a[3]]
+}
+
+/// a + b, wrapping (carries beyond 256 bits are dropped — callers guarantee
+/// no overflow: cumulative chain work fits far below 2^256).
+fn u256_add(a: &U256, b: &U256) -> U256 {
+    let mut out = [0u64; 4];
+    let mut carry = 0u64;
+    for i in 0..4 {
+        let (s1, c1) = a[i].overflowing_add(b[i]);
+        let (s2, c2) = s1.overflowing_add(carry);
+        out[i] = s2;
+        carry = (c1 as u64) + (c2 as u64);
+    }
+    out
+}
+
+fn u256_sub(a: &U256, b: &U256) -> U256 {
+    let mut out = [0u64; 4];
+    let mut borrow = 0u64;
+    for i in 0..4 {
+        let (d1, b1) = a[i].overflowing_sub(b[i]);
+        let (d2, b2) = d1.overflowing_sub(borrow);
+        out[i] = d2;
+        borrow = (b1 as u64) + (b2 as u64);
+    }
+    out
+}
+
+fn u256_shl1(a: &U256) -> U256 {
+    let mut out = [0u64; 4];
+    let mut carry = 0u64;
+    for i in 0..4 {
+        out[i] = (a[i] << 1) | carry;
+        carry = a[i] >> 63;
+    }
+    out
+}
+
+fn u256_bit(a: &U256, bit: usize) -> u64 {
+    (a[bit / 64] >> (bit % 64)) & 1
+}
+
+/// floor(n / d) by shift-subtract long division. d must be non-zero.
+fn u256_div(n: &U256, d: &U256) -> U256 {
+    let mut quotient = [0u64; 4];
+    let mut remainder = [0u64; 4];
+    for bit in (0..256).rev() {
+        remainder = u256_shl1(&remainder);
+        remainder[0] |= u256_bit(n, bit);
+        if u256_cmp(&remainder, d) != std::cmp::Ordering::Less {
+            remainder = u256_sub(&remainder, d);
+            quotient[bit / 64] |= 1u64 << (bit % 64);
+        }
+    }
+    quotient
+}
+
+fn u256_to_hex(a: &U256) -> String {
+    format!("{:016x}{:016x}{:016x}{:016x}", a[3], a[2], a[1], a[0])
+}
+
+fn u256_from_hex(s: &str) -> Option<U256> {
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u64; 4];
+    for i in 0..4 {
+        let start = 64 - (i + 1) * 16;
+        out[i] = u64::from_str_radix(&s[start..start + 16], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Decode compact-bits into a 256-bit target.
+fn target_from_bits(bits: u32) -> U256 {
+    let exponent = (bits >> 24) as usize;
+    let mantissa = (bits & 0x007fffff) as u64;
+    let mut t = [0u64; 4];
     if mantissa == 0 {
+        return t;
+    }
+    if exponent <= 3 {
+        t[0] = mantissa >> (8 * (3 - exponent));
+        return t;
+    }
+    // mantissa * 256^(exponent-3): shift left by 8*(exponent-3) bits.
+    let shift = 8 * (exponent - 3);
+    if shift >= 256 {
+        // Malformed/absurd bits — treat as max target (work ≈ 1).
+        return [u64::MAX; 4];
+    }
+    let limb = shift / 64;
+    let off = shift % 64;
+    t[limb] = mantissa << off;
+    if off > 0 && limb + 1 < 4 {
+        let hi = (mantissa as u128 >> (64 - off)) as u64;
+        t[limb + 1] = hi;
+    }
+    t
+}
+
+/// PER-BLOCK work from difficulty bits: exact 2^256 / (target+1), as a
+/// 64-char big-endian hex string (Bitcoin identity (~t)/(t+1) + 1).
+/// Genesis bits 0x1d00ffff → 0x…0100010001 (vector-tested).
+pub fn calculate_work(bits: u32) -> String {
+    let target = target_from_bits(bits);
+    if u256_is_zero(&target) {
+        // Zero target is malformed; report max work is WRONG for tip
+        // selection — use zero so a malformed header can never win.
         return "0".repeat(64);
     }
-
-    let shift_amount = if exponent >= 3 { 8 * (exponent - 3) } else { 0 };
-
-    let target = if exponent <= 3 {
-        mantissa >> (8 * (3 - exponent))
-    } else if shift_amount >= 128 {
-        // Target is very large, work is very small
-        return "0".repeat(63) + "1";
-    } else {
-        mantissa.checked_shl(shift_amount).unwrap_or(u128::MAX)
-    };
-
-    if target == 0 {
-        return format!("{:064x}", u128::MAX);
-    } else if target == u128::MAX {
+    if target == [u64::MAX; 4] {
         return "0".repeat(63) + "1";
     }
+    let one: U256 = [1, 0, 0, 0];
+    let t_plus_1 = u256_add(&target, &one);
+    let work = u256_add(&u256_div(&u256_not(&target), &t_plus_1), &one);
+    u256_to_hex(&work)
+}
 
-    let work = u128::MAX / (target + 1);
-    format!("{work:064x}")
+/// Sum two 64-char hex work values (cumulative chain work accumulation,
+/// TS addWork parity). Malformed inputs are treated as zero so legacy rows
+/// (which stored a garbage per-block constant) degrade harmlessly.
+pub fn add_work(a_hex: &str, b_hex: &str) -> String {
+    let a = u256_from_hex(a_hex).unwrap_or([0u64; 4]);
+    let b = u256_from_hex(b_hex).unwrap_or([0u64; 4]);
+    u256_to_hex(&u256_add(&a, &b))
+}
+
+/// True if work `a` is strictly more than `b` (both 64-char hex, fixed
+/// width ⇒ lexicographic compare is numeric compare; TS isMoreWork parity).
+/// Malformed values compare as zero.
+pub fn is_more_work(a_hex: &str, b_hex: &str) -> bool {
+    let a = u256_from_hex(a_hex).unwrap_or([0u64; 4]);
+    let b = u256_from_hex(b_hex).unwrap_or([0u64; 4]);
+    u256_cmp(&a, &b) == std::cmp::Ordering::Greater
 }
 
 /// Result of inserting a header into storage.
@@ -208,6 +342,12 @@ pub struct ChaintracksInfo {
     pub header_count: u64,
     pub is_syncing: bool,
     pub storage_type: String,
+    /// RFC3339 timestamp of the last successful sync (from sync_state) —
+    /// the API-visible freshness signal (audit M6): consumers must be able
+    /// to detect a stale tip instead of trusting it blindly.
+    pub last_synced_at: Option<String>,
+    /// Height recorded at the last successful sync.
+    pub last_synced_height: Option<u32>,
 }
 
 #[cfg(test)]
@@ -271,11 +411,49 @@ mod tests {
 
     #[test]
     fn test_calculate_work_genesis() {
-        // Genesis block bits = 0x1d00ffff
+        // Genesis block bits = 0x1d00ffff → EXACT work 0x0100010001
+        // (2^256 / (0x00000000ffff0000…0000 + 1); Bitcoin vector). The old
+        // u128 implementation returned the constant …0001 for every real
+        // header (audit M2) — this vector would have caught it.
         let work = calculate_work(0x1d00ffff);
-        // Should be non-zero, 64 hex chars
         assert_eq!(work.len(), 64);
-        assert_ne!(work, "0".repeat(64));
+        assert_eq!(
+            work,
+            format!("{:0>64}", "100010001"),
+            "genesis per-block work must be 0x100010001"
+        );
+    }
+
+    #[test]
+    fn test_calculate_work_modern_bits_exceeds_genesis() {
+        // A modern mainnet difficulty (~2^73 work per block) must dwarf
+        // genesis work — the old constant made all blocks equal.
+        let modern = calculate_work(0x180ed64f);
+        let genesis = calculate_work(0x1d00ffff);
+        assert!(is_more_work(&modern, &genesis));
+        assert_ne!(modern, genesis);
+    }
+
+    #[test]
+    fn test_add_work_cumulative() {
+        // height-1 cumulative chain work on mainnet = 0x200020002
+        let g = calculate_work(0x1d00ffff);
+        let sum = add_work(&g, &g);
+        assert_eq!(sum, format!("{:0>64}", "200020002"));
+        // adding malformed (legacy garbage) degrades to identity, not junk
+        assert_eq!(add_work(&g, "not-hex"), format!("{:0>64}", "100010001"));
+    }
+
+    #[test]
+    fn test_is_more_work_ordering() {
+        let g = calculate_work(0x1d00ffff);
+        let g2 = add_work(&g, &g);
+        assert!(is_more_work(&g2, &g));
+        assert!(!is_more_work(&g, &g2));
+        assert!(!is_more_work(&g, &g));
+        // malformed compares as zero — can never win
+        assert!(is_more_work(&g, "garbage"));
+        assert!(!is_more_work("garbage", &g));
     }
 
     #[test]
@@ -285,11 +463,11 @@ mod tests {
 
     #[test]
     fn test_calculate_work_zero_exponent() {
-        // Exponent 0 with nonzero mantissa: target shifts to 0, work is MAX
+        // Exponent 0 with nonzero mantissa: target decodes to 0 = malformed.
+        // Malformed bits now yield ZERO work (old code returned MAX): a
+        // garbage header must never be able to WIN tip selection.
         let work = calculate_work(0x00ffffff);
-        assert_eq!(work.len(), 64);
-        // Target is 0 because mantissa >> (8*3) = 0xffffff >> 24 = 0
-        assert_ne!(work, "0".repeat(64));
+        assert_eq!(work, "0".repeat(64));
     }
 
     #[test]

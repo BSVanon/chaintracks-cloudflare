@@ -1,4 +1,6 @@
 //! D1 database helpers — parameterized queries for Cloudflare D1.
+//!
+//! Adapted from ~/bsv/rust-overlay/crates/overlay-cloudflare/src/d1/mod.rs.
 
 use serde::de::DeserializeOwned;
 use worker::wasm_bindgen::JsValue;

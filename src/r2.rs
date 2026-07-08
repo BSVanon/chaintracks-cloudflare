@@ -3,6 +3,8 @@
 //! Exports block headers from D1 to R2 as concatenated 80-byte binary files
 //! (same format as Babbage CDN). Each file contains up to 100,000 headers.
 //! Also generates an index JSON (mainNetBlockHeaders.json) for client bootstrap.
+//!
+//! Based on ~/bsv/rust-wallet-infra/src/r2.rs for the R2 API pattern.
 
 use worker::{Bucket, D1Database};
 
@@ -53,6 +55,54 @@ pub async fn export_bulk_file(
     let bytes =
         hex::decode(&hex_str).map_err(|e| worker::Error::RustError(format!("hex decode: {e}")))?;
     let header_count = (bytes.len() / 80) as u32;
+
+    // ANCHOR GUARD (review M-1): a hole at the FILE START passes the
+    // linkage check below (rows begin at start+k, internally contiguous,
+    // every header shifted k slots). The first returned header must be the
+    // active header AT start_height.
+    if let Some(first_chunk) = bytes.chunks(80).next() {
+        if first_chunk.len() == 80 {
+            let first_hash = crate::types::compute_block_hash(first_chunk);
+            match storage::find_header_for_height(db, start_height).await? {
+                Some(expected) if expected.hash.eq_ignore_ascii_case(&first_hash) => {}
+                Some(expected) => {
+                    return Err(worker::Error::RustError(format!(
+                        "export {file_index}: first header {} is not the active header at height {} ({}) — refusing misaligned file",
+                        first_hash, start_height, expected.hash
+                    )));
+                }
+                None => {
+                    return Err(worker::Error::RustError(format!(
+                        "export {file_index}: no active header at start height {} — refusing",
+                        start_height
+                    )));
+                }
+            }
+        }
+    }
+
+    // HOLE GUARD (audit M4): get_headers_hex silently SKIPS missing heights,
+    // and bulk-file consumers index by offset = (height-first)*80 — one hole
+    // and every later header in the file sits at the wrong height. A partial
+    // trailing file is only legal for the LAST (tip) file; enforce
+    // contiguity by verifying linkage across the whole span.
+    let mut prev_hash: Option<String> = None;
+    for (i, chunk) in bytes.chunks(80).enumerate() {
+        if chunk.len() < 80 {
+            break;
+        }
+        if let Some(h) = crate::types::BlockHeader::from_bytes(chunk, start_height + i as u32) {
+            if let Some(ref expected_prev) = prev_hash {
+                if !h.previous_hash.eq_ignore_ascii_case(expected_prev) {
+                    return Err(worker::Error::RustError(format!(
+                        "export {file_index}: linkage break at offset {i} (height {}): header links {} but prior header is {} — refusing to publish a misaligned bulk file",
+                        start_height + i as u32, h.previous_hash, expected_prev
+                    )));
+                }
+            }
+            prev_hash = Some(h.hash);
+        }
+    }
 
     // Write binary file to R2
     let file_name = format!("{chain}Net_{file_index}.headers");

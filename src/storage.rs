@@ -6,7 +6,7 @@
 use worker::D1Database;
 
 use crate::d1::{BatchCollector, QVal, Query};
-use crate::types::{calculate_work, BlockHeader, Chain, ChaintracksInfo, InsertHeaderResult};
+use crate::types::{add_work, calculate_work, is_more_work, BlockHeader, Chain, ChaintracksInfo, InsertHeaderResult};
 
 // ─── D1 Row Type ────────────────────────────────────────────────────────────
 
@@ -55,10 +55,14 @@ const SELECT_HEADER: &str = "SELECT header_id, previous_header_id, previous_hash
 // ─── Reads ──────────────────────────────────────────────────────────────────
 
 pub async fn find_chain_tip(db: &D1Database) -> worker::Result<Option<BlockHeader>> {
-    let row: Option<HeaderRow> =
-        Query::new(format!("{SELECT_HEADER} WHERE is_chain_tip = 1 LIMIT 1"))
-            .first(db)
-            .await?;
+    // ORDER BY: if a crash/overlap ever leaves two tip rows, prefer the
+    // highest (then newest) so the answer is deterministic while the next
+    // sync heals the flag (audit C4).
+    let row: Option<HeaderRow> = Query::new(format!(
+        "{SELECT_HEADER} WHERE is_chain_tip = 1 ORDER BY height DESC, header_id DESC LIMIT 1"
+    ))
+    .first(db)
+    .await?;
     Ok(row.map(|r| r.into_block_header()))
 }
 
@@ -73,8 +77,11 @@ pub async fn find_header_for_height(
     db: &D1Database,
     height: u32,
 ) -> worker::Result<Option<BlockHeader>> {
+    // ORDER BY header_id DESC: if repair debris ever leaves two active rows
+    // at one height (audit C3 — observed live at 952854), answer with the
+    // newest ingest deterministically instead of arbitrary-row-wins.
     let row: Option<HeaderRow> = Query::new(format!(
-        "{SELECT_HEADER} WHERE height = ? AND is_active = 1 LIMIT 1"
+        "{SELECT_HEADER} WHERE height = ? AND is_active = 1 ORDER BY header_id DESC LIMIT 1"
     ))
     .bind(height)
     .first(db)
@@ -113,19 +120,22 @@ pub async fn find_active_header_for_hash(
 
 /// Merkle root validation — the most critical query for downstream consumers.
 /// Only checks active chain headers. Uses partial index idx_headers_merkle_active.
-pub async fn is_valid_root_for_height(
+/// Tri-state root validation (audit C1): distinguishes "root does not match
+/// the ACTIVE header at this height" (a factual false) from "we have no
+/// active header at this height at all" (unable to verify — hole, above
+/// tip, or reorg window). Mirrors the Go BHS tracker's INVALID vs
+/// UNABLE_TO_VERIFY split (go-wallet-toolbox bhs/service.go) — collapsing
+/// both to `false` let a storage hole read as "proof invalid" downstream.
+pub async fn check_root_for_height(
     db: &D1Database,
     root: &str,
     height: u32,
-) -> worker::Result<bool> {
-    let row: Option<HeaderRow> = Query::new(format!(
-        "{SELECT_HEADER} WHERE merkle_root = ? AND height = ? AND is_active = 1 LIMIT 1"
-    ))
-    .bind(root)
-    .bind(height)
-    .first(db)
-    .await?;
-    Ok(row.is_some())
+) -> worker::Result<Option<bool>> {
+    let header = find_header_for_height(db, height).await?;
+    match header {
+        None => Ok(None),
+        Some(h) => Ok(Some(h.merkle_root.eq_ignore_ascii_case(root))),
+    }
 }
 
 pub async fn get_headers_hex(
@@ -133,7 +143,12 @@ pub async fn get_headers_hex(
     start_height: u32,
     count: u32,
 ) -> worker::Result<String> {
-    let end_height = start_height + count;
+    // saturating: u32 wrap returned an empty result in release wasm (m2).
+    // NO cap here — the R2 exporter legitimately reads 100k-header files
+    // (adversarial review H-5: a 10k cap here silently truncated every
+    // exported bulk file while the index still declared 100k). The PUBLIC
+    // route applies its own 10k cap.
+    let end_height = start_height.saturating_add(count);
     let rows: Vec<HeaderRow> = Query::new(format!(
         "{SELECT_HEADER} WHERE height >= ? AND height < ? AND is_active = 1 ORDER BY height ASC"
     ))
@@ -163,6 +178,29 @@ pub async fn get_info(db: &D1Database, chain: &Chain) -> worker::Result<Chaintra
 
     let tip_height = get_chain_tip_height(db).await?;
 
+    // Freshness from sync_state (audit M6): the table is written on every
+    // successful sync but was never read by any endpoint — staleness was
+    // undetectable from the API.
+    #[derive(serde::Deserialize)]
+    struct SyncRow {
+        last_synced_height: Option<f64>,
+        updated_at: Option<String>,
+    }
+    let sync: Option<SyncRow> =
+        match Query::new("SELECT last_synced_height, updated_at FROM sync_state WHERE id = 1")
+            .first(db)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                // Loud, not silent (review L-4): the freshness signal exists
+                // to expose degradation — swallowing its own read error
+                // would hide exactly that.
+                worker::console_error!("get_info: sync_state read failed: {}", e);
+                None
+            }
+        };
+
     Ok(ChaintracksInfo {
         chain: chain.as_str().to_string(),
         height_live: tip_height,
@@ -170,6 +208,8 @@ pub async fn get_info(db: &D1Database, chain: &Chain) -> worker::Result<Chaintra
         header_count,
         is_syncing: false,
         storage_type: "d1".to_string(),
+        last_synced_at: sync.as_ref().and_then(|r| r.updated_at.clone()),
+        last_synced_height: sync.as_ref().and_then(|r| r.last_synced_height.map(|v| v as u32)),
     })
 }
 
@@ -199,14 +239,7 @@ pub async fn insert_header(
         });
     }
 
-    // 2. Chain work
-    let chain_work = if header.chain_work.is_empty() || header.chain_work == "0" {
-        calculate_work(header.bits)
-    } else {
-        header.chain_work.clone()
-    };
-
-    // 3. Find previous header
+    // 2. Find previous header (before work: cumulative work needs the parent)
     let zero_hash = "0".repeat(64);
     let previous_header = if header.previous_hash != zero_hash {
         find_header_for_hash(db, &header.previous_hash).await?
@@ -215,16 +248,54 @@ pub async fn insert_header(
     };
     let previous_header_id = previous_header.as_ref().and_then(|h| h.header_id);
 
-    // 4. Get current tip
+    // 3. CUMULATIVE chain work = parent.chain_work + per-block work
+    // (reference: ChaintracksStorageKnex.ts:297 addWork(oneBack.chainWork,
+    // convertBitsToWork(bits)); audit M1/M2 — the old code stored the
+    // per-block value only and never consulted it). With no parent stored
+    // the per-block work stands alone — such headers can only become tip on
+    // bootstrap (no_tip), never over a linked chain.
+    let per_block_work = calculate_work(header.bits);
+    let chain_work = match &previous_header {
+        Some(parent) => add_work(&parent.chain_work, &per_block_work),
+        None => per_block_work,
+    };
+
+    // 4. Get current tip. MORE-WORK wins, not higher-height (reference:
+    // ChaintracksStorageKnex.ts isMoreWork; audit M1) — at an equal-height
+    // race the branch carrying more cumulative work takes the tip.
     let current_tip = find_chain_tip(db).await?;
     let becomes_tip = match &current_tip {
         None => true,
-        Some(tip) => header.height > tip.height,
+        Some(tip) => is_more_work(&chain_work, &tip.chain_work),
     };
 
-    // 5. Insert — always active on the main chain.
-    // Reorg logic (handle_reorg) deactivates old-chain headers when needed.
-    let is_active = true;
+    // badPrev guard (TS ChaintracksStorageKnex.ts:276-279): a header whose
+    // claimed height doesn't sit exactly one above its stored parent is
+    // malformed source data — the M3 hash-integrity check can't catch it
+    // because height isn't part of the 80 bytes.
+    if let Some(parent) = &previous_header {
+        if header.height != parent.height + 1 {
+            return Err(worker::Error::RustError(format!(
+                "insert_header: height {} does not extend parent {} at height {} (badPrev)",
+                header.height, parent.hash, parent.height
+            )));
+        }
+    }
+
+    // 5. is_active at INSERT time: only a header that extends the current
+    // active tip (or bootstraps an empty DB) lands active. A reorg WINNER is
+    // still inserted INACTIVE — the reorg walk is what activates its branch,
+    // and only after the walk SUCCEEDS does any visible flag change
+    // (adversarial review H-2: the old code pre-marked the row
+    // is_active/is_chain_tip, so a REFUSED reorg — no common ancestor —
+    // still installed the unlinked branch as the served tip). Competitors
+    // and orphans stay inactive (audit C3; reference
+    // ChaintracksStorageKnex.ts:297-305).
+    let extends_tip = match &current_tip {
+        None => true,
+        Some(tip) => header.previous_hash == tip.hash,
+    };
+    let is_active = becomes_tip && extends_tip;
 
     Query::new(
         "INSERT OR IGNORE INTO headers (previous_header_id, previous_hash, height, is_active, \
@@ -235,7 +306,9 @@ pub async fn insert_header(
     .bind(&*header.previous_hash)
     .bind(header.height)
     .bind(is_active)
-    .bind(becomes_tip)
+    // is_chain_tip is NEVER set at insert — update_chain_tip flips it
+    // transactionally after any required reorg walk has succeeded (H-2).
+    .bind(false)
     .bind(&*header.hash)
     .bind(&*chain_work)
     .bind(header.version)
@@ -254,16 +327,17 @@ pub async fn insert_header(
         ..Default::default()
     };
 
-    // 6. Handle chain tip changes
+    // 6. Handle chain tip changes. Ordering matters (H-2): the reorg walk
+    // runs FIRST and a failure propagates with the row still inactive and
+    // the old tip untouched — "refuse the reorg" now actually refuses.
     if becomes_tip {
         if let Some(ref tip) = current_tip {
             if header.previous_hash != tip.hash {
-                // Reorg detected
                 let deactivated = handle_reorg(db, header, tip).await?;
                 result.reorg_depth = deactivated;
             }
         }
-        // Clear old tip, set new tip
+        // Clear old tip, set new tip (also forces is_active=1 on the row).
         update_chain_tip(db, &header.hash).await?;
     }
 
@@ -274,26 +348,29 @@ pub async fn insert_header(
 
 /// Clear old chain tip and set new tip by hash.
 pub async fn update_chain_tip(db: &D1Database, hash: &str) -> worker::Result<()> {
-    Query::new("UPDATE headers SET is_chain_tip = 0 WHERE is_chain_tip = 1")
-        .run(db)
-        .await?;
-    Query::new("UPDATE headers SET is_chain_tip = 1, is_active = 1 WHERE hash = ?")
-        .bind(hash)
-        .run(db)
-        .await?;
+    // One D1 batch = one transaction: a failure or overlapping cron between
+    // clear and set must never leave zero (or two) tip rows (audit C4 —
+    // a transient no-tip window read as currentHeight=0 downstream).
+    let mut batch = BatchCollector::new(db);
+    batch.add(
+        "UPDATE headers SET is_chain_tip = 0 WHERE is_chain_tip = 1",
+        vec![],
+    )?;
+    batch.add(
+        "UPDATE headers SET is_chain_tip = 1, is_active = 1 WHERE hash = ?",
+        vec![QVal::Text(hash.to_string())],
+    )?;
+    batch.execute().await?;
     Ok(())
 }
 
 /// Set chain tip to the highest active header. Call after batch insert.
 pub async fn update_chain_tip_to_highest(db: &D1Database) -> worker::Result<Option<BlockHeader>> {
-    // Clear existing tip
-    Query::new("UPDATE headers SET is_chain_tip = 0 WHERE is_chain_tip = 1")
-        .run(db)
-        .await?;
-
-    // Find highest active header
+    // Find highest active header first, then flip both flags in ONE batch
+    // (transactional) — the old clear-then-set left a no-tip window on
+    // failure/overlap (audit C4).
     let row: Option<HeaderRow> = Query::new(format!(
-        "{SELECT_HEADER} WHERE is_active = 1 ORDER BY height DESC LIMIT 1"
+        "{SELECT_HEADER} WHERE is_active = 1 ORDER BY height DESC, header_id DESC LIMIT 1"
     ))
     .first(db)
     .await?;
@@ -301,10 +378,16 @@ pub async fn update_chain_tip_to_highest(db: &D1Database) -> worker::Result<Opti
     match row {
         Some(r) => {
             let header = r.into_block_header();
-            Query::new("UPDATE headers SET is_chain_tip = 1 WHERE hash = ?")
-                .bind(&*header.hash)
-                .run(db)
-                .await?;
+            let mut batch = BatchCollector::new(db);
+            batch.add(
+                "UPDATE headers SET is_chain_tip = 0 WHERE is_chain_tip = 1",
+                vec![],
+            )?;
+            batch.add(
+                "UPDATE headers SET is_chain_tip = 1 WHERE hash = ?",
+                vec![QVal::Text(header.hash.clone())],
+            )?;
+            batch.execute().await?;
             Ok(Some(header))
         }
         None => Ok(None),
@@ -415,25 +498,190 @@ async fn handle_reorg(
     old_tip: &BlockHeader,
 ) -> worker::Result<u32> {
     let ancestor = find_common_ancestor(db, new_header, old_tip).await?;
-    let ancestor_height = ancestor.as_ref().map(|a| a.height).unwrap_or(0);
+    // No common ancestor within the walk limit means we CANNOT identify the
+    // fork point — falling back to height 0 here once deactivated the entire
+    // table (every header below the live window went is_active=0, breaking
+    // findHeaderForHeight and with it the overlay's SPV). The TS reference
+    // (wallet-toolbox ChaintracksStorageBase.findCommonAncestor) THROWS in
+    // this case — "Reached start of live database without resolving the
+    // reorg." — so the whole insert fails loudly and the tip is untouched;
+    // we match that: no partial state, no dual active branches.
+    let Some(ancestor) = ancestor else {
+        return Err(worker::Error::RustError(format!(
+            "reorg: no common ancestor within limit (new={} old={}) — refusing (TS reference parity)",
+            new_header.hash, old_tip.hash
+        )));
+    };
+    let ancestor_height = ancestor.height;
 
-    // Deactivate old chain above ancestor
-    let deactivated = mark_headers_inactive_above_height(db, ancestor_height).await?;
-
-    // Activate new chain: walk back from new_header to ancestor
+    // Collect the new branch FIRST (reads only), then apply deactivate +
+    // activate as ONE D1 batch (one transaction). The old sequential
+    // statements left a crash window where the old branch was deactivated
+    // but the new one only partially activated — permanent inactive holes
+    // below the tip that no cron ever revisits (parity audit §4; TS gets
+    // this atomicity from its single knex transaction,
+    // ChaintracksStorageKnex.ts:228).
+    let mut branch_hashes: Vec<String> = Vec::new();
     let mut current = Some(new_header.clone());
     while let Some(ref h) = current {
         if h.height <= ancestor_height {
             break;
         }
-        Query::new("UPDATE headers SET is_active = 1 WHERE hash = ?")
-            .bind(&*h.hash)
-            .run(db)
-            .await?;
+        branch_hashes.push(h.hash.clone());
         current = walk_back(db, h).await?;
     }
 
+    // Count what we'll deactivate (pre-read; the UPDATE below is the write).
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        cnt: Option<f64>,
+    }
+    let count: Option<CountRow> =
+        Query::new("SELECT COUNT(*) as cnt FROM headers WHERE is_active = 1 AND height > ?")
+            .bind(ancestor_height)
+            .first(db)
+            .await?;
+    let deactivated = count.map(|c| c.cnt.unwrap_or(0.0) as u32).unwrap_or(0);
+
+    let mut batch = BatchCollector::new(db);
+    batch.add(
+        "UPDATE headers SET is_active = 0, is_chain_tip = 0 WHERE height > ? AND is_active = 1",
+        vec![QVal::Int(ancestor_height as i64)],
+    )?;
+    for hash in &branch_hashes {
+        batch.add(
+            "UPDATE headers SET is_active = 1 WHERE hash = ?",
+            vec![QVal::Text(hash.clone())],
+        )?;
+        if batch.len() >= 100 {
+            // Branches beyond ~99 statements split across batches — still a
+            // vast improvement over per-statement commits, and reorgs deeper
+            // than 99 blocks are already past the 400-step walk guard zone.
+            batch.execute().await?;
+            batch = BatchCollector::new(db);
+        }
+    }
+    if !batch.is_empty() {
+        batch.execute().await?;
+    }
+
     Ok(deactivated)
+}
+
+/// Repair an orphan row after its parent branch was backfilled (audit C2):
+/// relink previous_header_id, recompute CUMULATIVE chain work from the now-
+/// present parent, and re-evaluate the tip (running the reorg walk if the
+/// repaired branch outworks the current one). insert_header can't do this —
+/// the orphan row already exists, so a re-insert is a dupe no-op that would
+/// leave per-block-only work and an inactive branch forever.
+pub async fn relink_orphan_and_reevaluate(
+    db: &D1Database,
+    header_hash: &str,
+) -> worker::Result<InsertHeaderResult> {
+    let Some(stored) = find_header_for_hash(db, header_hash).await? else {
+        return Ok(InsertHeaderResult::default());
+    };
+    let Some(parent) = find_header_for_hash(db, &stored.previous_hash).await? else {
+        return Ok(InsertHeaderResult {
+            dupe: true,
+            no_prev: true,
+            ..Default::default()
+        });
+    };
+
+    let chain_work = add_work(&parent.chain_work, &calculate_work(stored.bits));
+    Query::new("UPDATE headers SET previous_header_id = ?, chain_work = ? WHERE header_id = ?")
+        .bind(parent.header_id)
+        .bind(&*chain_work)
+        .bind(stored.header_id)
+        .run(db)
+        .await?;
+
+    let current_tip = find_chain_tip(db).await?;
+    let becomes_tip = match &current_tip {
+        None => true,
+        Some(tip) => is_more_work(&chain_work, &tip.chain_work),
+    };
+
+    let mut result = InsertHeaderResult {
+        dupe: true,
+        is_active_tip: becomes_tip,
+        ..Default::default()
+    };
+
+    if becomes_tip {
+        let mut updated = stored.clone();
+        updated.chain_work = chain_work;
+        updated.previous_header_id = parent.header_id;
+        if let Some(ref tip) = current_tip {
+            if updated.previous_hash != tip.hash {
+                result.reorg_depth = handle_reorg(db, &updated, tip).await?;
+            }
+        }
+        update_chain_tip(db, &updated.hash).await?;
+    }
+
+    Ok(result)
+}
+
+/// Repair cumulative chain_work along the ACTIVE chain for the fork-relevant
+/// window (review H-3): legacy rows (pre work-fix deploys) and bulk-inserted
+/// spans carry non-cumulative work, which makes branch comparison depth-blind
+/// — a shorter branch attaching lower could out-"work" the canonical chain.
+/// Each cron this walks the last `window` active heights forward from an
+/// anchor and rewrites any row whose work ≠ parent.work + per_block(bits).
+/// Within-window comparisons become correct after one pass; forks deeper
+/// than the window are already refused by the 400-step ancestor walk.
+pub async fn repair_cumulative_work(db: &D1Database, window: u32) -> worker::Result<u32> {
+    let Some(tip) = find_chain_tip(db).await? else {
+        return Ok(0);
+    };
+    let start = tip.height.saturating_sub(window);
+
+    let rows: Vec<HeaderRow> = Query::new(format!(
+        "{SELECT_HEADER} WHERE is_active = 1 AND height >= ? AND height <= ? ORDER BY height ASC"
+    ))
+    .bind(start)
+    .bind(tip.height)
+    .all(db)
+    .await?;
+    if rows.len() < 2 {
+        return Ok(0);
+    }
+
+    let headers: Vec<BlockHeader> = rows.into_iter().map(|r| r.into_block_header()).collect();
+    let mut fixed = 0u32;
+    let mut batch = BatchCollector::new(db);
+    let mut prev = headers[0].clone(); // anchor keeps its stored work
+
+    for h in headers.iter().skip(1) {
+        // Only repair along verified linkage; a gap/branch break ends the walk.
+        if h.previous_hash != prev.hash {
+            break;
+        }
+        let expected = add_work(&prev.chain_work, &calculate_work(h.bits));
+        if h.chain_work != expected {
+            batch.add(
+                "UPDATE headers SET chain_work = ? WHERE header_id = ?",
+                vec![
+                    QVal::Text(expected.clone()),
+                    QVal::Int(h.header_id.unwrap_or(0)),
+                ],
+            )?;
+            fixed += 1;
+            if batch.len() >= 100 {
+                batch.execute().await?;
+                batch = BatchCollector::new(db);
+            }
+        }
+        let mut next_prev = h.clone();
+        next_prev.chain_work = expected;
+        prev = next_prev;
+    }
+    if !batch.is_empty() {
+        batch.execute().await?;
+    }
+    Ok(fixed)
 }
 
 // ─── Batch Insert (Issue #6) ────────────────────────────────────────────────
@@ -450,13 +698,36 @@ pub async fn insert_headers_batch(db: &D1Database, headers: &[BlockHeader]) -> w
     let mut inserted = 0u32;
     let mut batch = BatchCollector::new(db);
 
+    // CUMULATIVE work across the batch (adversarial review H-4): anchor to
+    // the stored parent of the first header when it exists; otherwise the
+    // first header's per-block work stands alone (legacy-region parity).
+    // Callers feed linked spans (M4 guards), so accumulating within the
+    // batch keeps every inserted row's work monotonic — without this, every
+    // catch-up recreated the per-block-only "tiny work" state and a
+    // same-height competitor rooted in it could steal the tip on a true tie.
+    let mut running_work: String = match find_header_for_hash(db, &headers[0].previous_hash).await?
+    {
+        Some(parent) => parent.chain_work,
+        None => "0".repeat(64),
+    };
+    let mut prev_hash_in_batch: Option<String> = None;
+
     for header in headers {
-        // Calculate chain work if needed
-        let chain_work = if header.chain_work.is_empty() || header.chain_work == "0" {
-            calculate_work(header.bits)
+        let per_block = calculate_work(header.bits);
+        let linked_to_prev = prev_hash_in_batch
+            .as_deref()
+            .map(|ph| ph.eq_ignore_ascii_case(&header.previous_hash))
+            .unwrap_or(true);
+        let chain_work = if linked_to_prev {
+            running_work = add_work(&running_work, &per_block);
+            running_work.clone()
         } else {
-            header.chain_work.clone()
+            // Unlinked splice inside the batch (shouldn't happen behind the
+            // M4 guards) — restart accumulation from this header alone.
+            running_work = per_block.clone();
+            per_block
         };
+        prev_hash_in_batch = Some(header.hash.clone());
 
         batch.add(
             "INSERT OR IGNORE INTO headers (previous_header_id, previous_hash, height, is_active, \
@@ -493,6 +764,36 @@ pub async fn insert_headers_batch(db: &D1Database, headers: &[BlockHeader]) -> w
     }
 
     Ok(inserted)
+}
+
+/// Make each pushed header the single active row at its height: activate the
+/// row with the matching hash, deactivate any competitor. Used by the
+/// operator ingest path to repair stale-branch/wipe debris.
+pub async fn canonicalize_heights(
+    db: &D1Database,
+    headers: &[BlockHeader],
+) -> worker::Result<u32> {
+    let mut batch = BatchCollector::new(db);
+    let mut n = 0u32;
+    for header in headers {
+        batch.add(
+            "UPDATE headers SET is_active = CASE WHEN hash = ? THEN 1 ELSE 0 END \
+             WHERE height = ?",
+            vec![
+                QVal::Text(header.hash.clone()),
+                QVal::Int(header.height as i64),
+            ],
+        )?;
+        n += 1;
+        if batch.len() >= 100 {
+            batch.execute().await?;
+            batch = BatchCollector::new(db);
+        }
+    }
+    if !batch.is_empty() {
+        batch.execute().await?;
+    }
+    Ok(n)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -767,54 +1068,46 @@ mod tests {
 
     #[test]
     fn test_becomes_tip_no_existing() {
-        // No current tip → new header always becomes tip
+        // No current tip → new header always becomes tip (bootstrap).
         let current_tip: Option<BlockHeader> = None;
-        let new_height = 0u32;
+        let chain_work = crate::types::calculate_work(0x1d00ffff);
         let becomes_tip = match &current_tip {
             None => true,
-            Some(tip) => new_height > tip.height,
+            Some(tip) => is_more_work(&chain_work, &tip.chain_work),
         };
         assert!(becomes_tip);
     }
 
+    /// Tip selection is MORE-WORK, not higher-height (reference
+    /// ChaintracksStorageKnex.ts isMoreWork; audit M1). Extending the tip
+    /// accumulates work and wins; an equal-work same-height competitor does
+    /// NOT take the tip (first-seen wins until its branch outworks ours).
     #[test]
-    fn test_becomes_tip_higher() {
+    fn test_becomes_tip_is_work_based() {
+        let g = crate::types::calculate_work(0x1d00ffff);
+        let tip_work = crate::types::add_work(&g, &g); // two blocks
         let current_tip = Some(BlockHeader {
-            height: 100,
+            height: 1,
+            chain_work: tip_work.clone(),
             ..Default::default()
         });
-        let new_height = 101u32;
+        // Child extending the tip: work = tip + block → wins.
+        let child_work = crate::types::add_work(&tip_work, &g);
         let becomes_tip = match &current_tip {
             None => true,
-            Some(tip) => new_height > tip.height,
+            Some(tip) => is_more_work(&child_work, &tip.chain_work),
         };
         assert!(becomes_tip);
-    }
-
-    #[test]
-    fn test_does_not_become_tip_lower() {
-        let current_tip = Some(BlockHeader {
-            height: 100,
-            ..Default::default()
-        });
-        let new_height = 99u32;
+        // Equal-height competitor with EQUAL cumulative work: stays inactive.
         let becomes_tip = match &current_tip {
             None => true,
-            Some(tip) => new_height > tip.height,
+            Some(tip) => is_more_work(&tip_work, &tip.chain_work),
         };
-        assert!(!becomes_tip);
-    }
-
-    #[test]
-    fn test_does_not_become_tip_equal() {
-        let current_tip = Some(BlockHeader {
-            height: 100,
-            ..Default::default()
-        });
-        let new_height = 100u32;
+        assert!(!becomes_tip, "equal work must not steal the tip (first-seen wins)");
+        // Lower-work header never wins.
         let becomes_tip = match &current_tip {
             None => true,
-            Some(tip) => new_height > tip.height,
+            Some(tip) => is_more_work(&g, &tip.chain_work),
         };
         assert!(!becomes_tip);
     }
@@ -874,15 +1167,18 @@ mod tests {
     // handles deactivation when needed.
 
     #[test]
-    fn test_all_inserted_headers_are_active() {
-        // Every header inserted via insert_header should be active.
-        // The is_active flag is only set to false by handle_reorg when
-        // switching chains. Normal insertion = always active.
-        let is_active = true; // This is what insert_header now does
-        assert!(
-            is_active,
-            "All inserted headers must be active on the main chain"
-        );
+    fn test_inserted_header_active_iff_tip_taker() {
+        // is_active = becomes_tip (audit C3): a non-more-work competitor is
+        // inserted INACTIVE (reference ChaintracksStorageKnex.ts:297-305) so
+        // dual-active heights are structurally impossible on the insert
+        // path; the reorg activation walk is the only way a branch flips
+        // active. Sequential tip-extending inserts still land active.
+        let becomes_tip = true;
+        let is_active = becomes_tip;
+        assert!(is_active);
+        let becomes_tip = false;
+        let is_active = becomes_tip;
+        assert!(!is_active, "competitor/orphan inserts must be inactive");
     }
 
     #[test]

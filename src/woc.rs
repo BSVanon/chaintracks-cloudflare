@@ -1,6 +1,8 @@
 //! WhatsOnChain HTTP client via worker::Fetch.
 //!
 //! CF Workers can't use reqwest — all HTTP goes through worker::Fetch.
+//! Based on ~/bsv/rust-wallet-infra/src/services/woc.rs and
+//! ~/bsv/rust-overlay/crates/overlay-cloudflare/src/chain_tracker.rs.
 
 use serde::Deserialize;
 use worker::{console_log, Fetch, Headers, Method, Request, RequestInit};
@@ -12,6 +14,11 @@ use crate::types::{BlockHeader, Chain};
 #[derive(Debug, Deserialize)]
 pub struct WocChainInfo {
     pub blocks: u32,
+    /// Best block hash — used to detect equal-height reorgs (audit C2): a
+    /// tip-height match with a DIFFERENT hash means WoC switched branches
+    /// at our height and we must fetch the competitor.
+    #[serde(rename = "bestblockhash")]
+    pub best_block_hash: Option<String>,
 }
 
 /// WoC block header response from /block/{hash}/header or /block/headers
@@ -30,12 +37,24 @@ pub struct WocBlockHeader {
 
 impl WocBlockHeader {
     /// Convert to our BlockHeader type.
-    pub fn into_block_header(self) -> BlockHeader {
+    ///
+    /// INTEGRITY (audit M3): the hash is RECOMPUTED from the 80 serialized
+    /// header bytes and must match what WoC claimed — the reference rejects
+    /// any ingested header whose hash doesn't hash from its own fields
+    /// (wallet-toolbox blockHeaderUtilities.ts:371-373 validateHeaderFormat).
+    /// A mismatch means WoC served inconsistent fields; storing it would
+    /// desync hash-keyed lookups from the stored bytes.
+    pub fn into_block_header(self) -> worker::Result<BlockHeader> {
         let bits = u32::from_str_radix(&self.bits, 16).unwrap_or(0);
         let chain_work = crate::types::calculate_work(bits);
-        let previous_hash = self.previous_block_hash.unwrap_or_else(|| "0".repeat(64));
+        // WoC returns "" (empty string, not null) for genesis-style rows —
+        // normalize to the canonical 64-zero hash (review L-5).
+        let previous_hash = self
+            .previous_block_hash
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "0".repeat(64));
 
-        BlockHeader {
+        let header = BlockHeader {
             header_id: None,
             previous_header_id: None,
             version: self.version,
@@ -49,7 +68,16 @@ impl WocBlockHeader {
             chain_work,
             is_active: true,
             is_chain_tip: false,
+        };
+
+        let computed = crate::types::compute_block_hash(&header.to_bytes());
+        if !computed.eq_ignore_ascii_case(&header.hash) {
+            return Err(worker::Error::RustError(format!(
+                "WoC header integrity failure at height {}: claimed hash {} but fields hash to {}",
+                header.height, header.hash, computed
+            )));
         }
+        Ok(header)
     }
 }
 
@@ -93,7 +121,9 @@ impl WocClient {
         let _ = headers.set("Accept", "application/json");
         if let Some(ref key) = self.api_key {
             if !key.is_empty() {
-                let _ = headers.set("woc-api-key", key);
+                // WoC only grants the authenticated quota via the Authorization
+                // header (verified live: woc-api-key returns no rate headers).
+                let _ = headers.set("Authorization", key);
             }
         }
         init.with_headers(headers);
@@ -151,7 +181,21 @@ impl WocClient {
     pub async fn get_header_by_height(&self, height: u32) -> worker::Result<BlockHeader> {
         let url = format!("{}/block/height/{height}", self.base_url);
         let woc_header: WocBlockHeader = self.fetch_json(&url).await?;
-        Ok(woc_header.into_block_header())
+        woc_header.into_block_header()
+    }
+
+    /// Get block header by hash (WoC `/block/hash/{hash}/header`). Used for
+    /// competitor-branch and missing-parent backfill during reorgs (audit
+    /// C2) — those headers are unreachable by height because a different
+    /// branch owns the height locally.
+    pub async fn get_header_by_hash(&self, hash: &str) -> worker::Result<BlockHeader> {
+        // NOTE the path: WoC serves header-by-hash at /block/{hash}/header —
+        // NOT /block/hash/{hash}/header (that 404s; verified live 2026-07-07.
+        // Adversarial review C-1: the wrong path made ALL reorg backfill
+        // machinery dead on arrival).
+        let url = format!("{}/block/{hash}/header", self.base_url);
+        let woc_header: WocBlockHeader = self.fetch_json(&url).await?;
+        woc_header.into_block_header()
     }
 
     // ─── Bulk CDN ───────────────────────────────────────────────────────────
@@ -201,7 +245,7 @@ impl WocClient {
         );
 
         let bytes = self.fetch_bytes(&url).await?;
-        let mut headers = Vec::with_capacity(bytes.len() / 80);
+        let mut headers: Vec<BlockHeader> = Vec::with_capacity(bytes.len() / 80);
 
         for (i, chunk) in bytes.chunks(80).enumerate() {
             if chunk.len() < 80 {
@@ -209,7 +253,24 @@ impl WocClient {
             }
             let height = start_height + i as u32;
             if let Some(header) = BlockHeader::from_bytes(chunk, height) {
+                // Linkage guard (audit M4 extension — the CDN path had none):
+                // heights are assigned blindly as start+i, so a gap/splice in
+                // the file would store every later header at the wrong
+                // height. Truncate at the first break; ingest the verified
+                // prefix only (TS validateBufferOfHeaders parity).
+                if let Some(prev) = headers.last() {
+                    if !header.previous_hash.eq_ignore_ascii_case(&prev.hash) {
+                        console_log!(
+                            "Bulk file {} linkage break at height {} — truncating",
+                            file_info.file_name,
+                            height
+                        );
+                        break;
+                    }
+                }
                 headers.push(header);
+            } else {
+                break;
             }
         }
 
@@ -271,7 +332,8 @@ mod tests {
         assert_eq!(woc.bits, "1d00ffff");
         assert!(woc.previous_block_hash.is_none());
 
-        let header = woc.into_block_header();
+        // Real genesis fields hash to the claimed hash — integrity passes.
+        let header = woc.into_block_header().expect("genesis integrity");
         assert_eq!(header.bits, 0x1d00ffff);
         assert_eq!(header.previous_hash, "0".repeat(64));
         assert!(!header.chain_work.is_empty());
@@ -279,10 +341,15 @@ mod tests {
         assert!(!header.is_chain_tip);
     }
 
+    /// Integrity regression (audit M3): a header whose claimed hash does
+    /// not hash from its own fields must be REJECTED at ingest, matching
+    /// wallet-toolbox validateHeaderFormat (blockHeaderUtilities.ts:371-373).
+    /// The old code stored WoC's hash verbatim — one inconsistent response
+    /// desynced hash-keyed lookups from the stored bytes forever.
     #[test]
-    fn test_woc_block_header_with_prev() {
+    fn test_woc_block_header_integrity_rejects_mismatched_hash() {
         let json = serde_json::json!({
-            "hash": "hash_1",
+            "hash": "hash_1",           // fabricated — cannot hash from fields
             "height": 1,
             "version": 1,
             "merkleroot": "merkle_1",
@@ -293,9 +360,10 @@ mod tests {
         });
 
         let woc: WocBlockHeader = serde_json::from_value(json).unwrap();
-        let header = woc.into_block_header();
-        assert_eq!(header.previous_hash, "hash_0");
-        assert_eq!(header.height, 1);
+        assert!(
+            woc.into_block_header().is_err(),
+            "mismatched hash must be rejected at ingest"
+        );
     }
 
     #[test]
@@ -365,7 +433,8 @@ mod tests {
         });
 
         let woc: WocBlockHeader = serde_json::from_value(json).unwrap();
-        let header = woc.into_block_header();
+        // Real block-1 fields hash to the claimed hash — integrity passes.
+        let header = woc.into_block_header().expect("block-1 integrity");
         assert_eq!(header.height, 1);
         assert_eq!(
             header.hash,

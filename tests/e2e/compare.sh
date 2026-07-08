@@ -1,16 +1,11 @@
 #!/bin/bash
-# Compare two chaintracks instances endpoint-by-endpoint.
-# Usage: ./tests/e2e/compare.sh <under_test_url> <reference_url>
+# Compare a chaintracks-cloudflare deployment against a reference chaintracks instance
+# Usage: ./tests/e2e/compare.sh [rust_url] [prod_url]
 #
-# Verifies 1:1 parity between an instance under test (typically this worker)
-# and a reference chaintracks instance known to be correct.
+# Verifies 1:1 parity between our Rust CF Worker and the Node.js production server.
 
-if [ -z "$1" ] || [ -z "$2" ]; then
-    echo "Usage: $0 <under_test_url> <reference_url>" >&2
-    exit 2
-fi
-RUST_URL="$1"
-PROD_URL="$2"
+RUST_URL="${1:?usage: compare.sh <your-worker-url> <reference-url>}"
+PROD_URL="${2:?usage: compare.sh <your-worker-url> <reference-url>}"
 
 PASS=0
 FAIL=0
@@ -106,7 +101,7 @@ compare "/findChainTipHashHex" "Chain tip hash" status_only
 
 # ─── Known block vectors ─────────────────────────────────────
 # These test against height 0 (genesis) which should match exactly
-# once the instance has data seeded
+# once rust-chaintracks has data seeded
 compare "/findHeaderHexForHeight?height=0" "Genesis header" json_value
 compare "/getHeaders?height=0&count=1" "Genesis header hex" json_value
 compare "/getHeaders?height=0&count=2" "Genesis+Block1 hex" json_value
