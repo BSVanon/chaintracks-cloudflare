@@ -17,7 +17,7 @@ WHATSONCHAIN_API_KEY = ""
 UPSTREAM_CHAINTRACKS_URL = ""
 
 [build]
-command = "worker-build --release"
+command = "cargo install -q worker-build@0.7.5 && worker-build --release"
 
 [[d1_databases]]
 binding = "DB"
