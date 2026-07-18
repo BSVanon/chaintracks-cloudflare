@@ -29,3 +29,6 @@ secrets.md
 .vscode/
 *.code-workspace
 .claude/worktrees/
+
+# Local CARGO_TARGET_DIR
+/.cargo-targets/

@@ -208,6 +208,11 @@ pub struct ChaintracksInfo {
     pub header_count: u64,
     pub is_syncing: bool,
     pub storage_type: String,
+    /// Last-observed network tip (WhatsOnChain). 0 until the first cron tick
+    /// after migration 0002 runs.
+    pub woc_tip: u32,
+    /// How many blocks behind the network tip we are (0 = caught up).
+    pub behind_by: u32,
 }
 
 #[cfg(test)]

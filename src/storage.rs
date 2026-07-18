@@ -163,14 +163,41 @@ pub async fn get_info(db: &D1Database, chain: &Chain) -> worker::Result<Chaintra
 
     let tip_height = get_chain_tip_height(db).await?;
 
+    // Last-observed network tip, persisted by the cron. Defaults to 0 if the
+    // column is absent (pre-migration-0002) so /getInfo never hard-fails.
+    let woc_tip = get_woc_tip_height(db).await.unwrap_or(0);
+    let behind_by = woc_tip.saturating_sub(tip_height);
+
     Ok(ChaintracksInfo {
         chain: chain.as_str().to_string(),
         height_live: tip_height,
         height_bulk: 0,
         header_count,
-        is_syncing: false,
+        // Report "syncing" whenever we're more than a couple blocks behind the
+        // last-seen tip — an external monitor can alarm on this or on behind_by.
+        is_syncing: behind_by > 2,
         storage_type: "d1".to_string(),
+        woc_tip,
+        behind_by,
     })
+}
+
+/// Last network tip observed by the cron (sync_state.woc_tip_height).
+/// Errors (e.g. column absent before migration 0002) propagate so the caller
+/// can default to 0.
+async fn get_woc_tip_height(db: &D1Database) -> worker::Result<u32> {
+    #[derive(serde::Deserialize)]
+    struct TipRow {
+        woc_tip_height: Option<f64>,
+    }
+    let row: Option<TipRow> =
+        Query::new("SELECT woc_tip_height FROM sync_state WHERE id = 1")
+            .first(db)
+            .await?;
+    Ok(row
+        .and_then(|r| r.woc_tip_height)
+        .map(|h| h as u32)
+        .unwrap_or(0))
 }
 
 // ─── Writes (Issue #5: insert_header) ───────────────────────────────────────

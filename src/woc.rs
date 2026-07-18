@@ -66,7 +66,18 @@ pub struct BulkHeaderFilesInfo {
 pub struct BulkHeaderFileInfo {
     pub file_name: String,
     pub first_height: Option<u32>,
+    /// Number of headers in this file. Used to compute the snapshot's top
+    /// height so the cron can stop pulling bulk files once it's exhausted.
+    pub count: Option<u32>,
     pub source_url: Option<String>,
+}
+
+impl BulkHeaderFileInfo {
+    /// Height just past the last header this file provides (exclusive upper
+    /// bound). Falls back to a 100k stride when `count` is absent.
+    pub fn coverage_end(&self) -> u32 {
+        self.first_height.unwrap_or(0) + self.count.unwrap_or(100_000)
+    }
 }
 
 // ─── WoC Client ─────────────────────────────────────────────────────────────
@@ -131,6 +142,30 @@ impl WocClient {
         if !(200..300).contains(&status) {
             return Err(worker::Error::RustError(format!(
                 "CDN HTTP {status} for {url}"
+            )));
+        }
+
+        response.bytes().await
+    }
+
+    /// Fetch a byte range `[start, end]` (inclusive) via an HTTP Range request.
+    /// The header CDN returns 206 Partial Content, so a tick pulls only the
+    /// slice it needs instead of the whole 8MB file.
+    async fn fetch_bytes_range(&self, url: &str, start: u64, end: u64) -> worker::Result<Vec<u8>> {
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get);
+        let headers = Headers::new();
+        let _ = headers.set("Range", &format!("bytes={start}-{end}"));
+        init.with_headers(headers);
+
+        let request = Request::new_with_init(url, &init)?;
+        let mut response = Fetch::Request(request).send().await?;
+
+        let status = response.status_code();
+        // 206 Partial Content (and 200 if the server ignores Range) are OK.
+        if !(200..300).contains(&status) {
+            return Err(worker::Error::RustError(format!(
+                "CDN range HTTP {status} for {url}"
             )));
         }
 
@@ -218,6 +253,55 @@ impl WocClient {
             headers.len(),
             file_info.file_name
         );
+        Ok(headers)
+    }
+
+    /// Download and parse a bounded slice of a bulk header file via an HTTP
+    /// Range request — `count` headers starting at `start_height`. Keeps each
+    /// cron tick small enough to always complete (tiny download + parse + a
+    /// bounded batch insert), unlike pulling the full 8MB file at once.
+    ///
+    /// `file_first_height` is the height of the file's first header (its byte
+    /// offset origin); `start_height` must be >= it and within the file.
+    pub async fn download_bulk_range(
+        &self,
+        file_info: &BulkHeaderFileInfo,
+        file_first_height: u32,
+        start_height: u32,
+        count: u32,
+    ) -> worker::Result<Vec<BlockHeader>> {
+        if count == 0 || start_height < file_first_height {
+            return Ok(Vec::new());
+        }
+        let cdn_base = "https://cdn.projectbabbage.com/blockheaders";
+        let url = file_info
+            .source_url
+            .as_deref()
+            .map(|base| format!("{base}/{}", file_info.file_name))
+            .unwrap_or_else(|| format!("{cdn_base}/{}", file_info.file_name));
+
+        let byte_start = (start_height - file_first_height) as u64 * 80;
+        let byte_end = byte_start + (count as u64 * 80) - 1; // inclusive
+
+        console_log!(
+            "Range {}: heights {}..{} ({} bytes)",
+            file_info.file_name,
+            start_height,
+            start_height + count,
+            count * 80
+        );
+
+        let bytes = self.fetch_bytes_range(&url, byte_start, byte_end).await?;
+        let mut headers = Vec::with_capacity(bytes.len() / 80);
+        for (i, chunk) in bytes.chunks(80).enumerate() {
+            if chunk.len() < 80 {
+                break;
+            }
+            let height = start_height + i as u32;
+            if let Some(header) = BlockHeader::from_bytes(chunk, height) {
+                headers.push(header);
+            }
+        }
         Ok(headers)
     }
 }
